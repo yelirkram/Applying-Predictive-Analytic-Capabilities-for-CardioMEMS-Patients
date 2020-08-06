@@ -1,0 +1,397 @@
+---
+title: "CardioMEMS Model 3 - IV Diuretic Therapy"
+author: "Mark Riley"
+date: "8/5/2020"
+output: word_document
+---
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("~/Dropbox/UWLax/DS785/Data")
+
+require(tidyverse) # For data manipulation
+require(gt) # For pretty tables
+require(leaps) # Subsets
+require(broom) # Nice summary tables
+require(gt) # Pretty tables
+require(randomForest) # Random Forest
+require(gbm) # Boosting
+require(caret) # Test, train split and cross validation
+require(ROSE) # balancing the training dataset
+require(pROC) # ROC-AUC
+
+# Go Eagles! UW-La Crosse school colors
+laxMaroon = "#830019"
+laxGray = "#969799"
+
+# Load the data
+m3.cardiomems <- read_csv("cardiomems_full_dataset.csv")
+
+# Drop columns that have no predictive value or are directly related to/derived from the dependent var
+m3.cardiomems <- m3.cardiomems %>% select(-one_of("ID"))
+
+m3.dep_var <- "IVDiuretic"
+
+```
+
+```{r Column Names, echo=FALSE, warning=FALSE, message=FALSE}
+
+# Get all the boolean column names that can be used as predictors
+m3.bool_cols <- c("AllAdmission",
+                  "HFAdmission",
+                  "Obesity",
+                  "CoronaryArteryDisease",
+                  "ValvularHeartDisease",
+                  "HighCholesterol",
+                  "AlcoholAbuse",
+                  "SleepApnea",
+                  "CPAPUsage",
+                  "RenalFailure",
+                  "Insulin",
+                  "RaceWhite",
+                  "SGLT2",
+                  "Metformin",
+                  "DPPV4",
+                  "GLP1",
+                  "CongestiveHF",
+                  "PulmonaryCirculation",
+                  "PeripheralVascular",
+                  "NeurologicalDisorder",
+                  "ChronicPulmonary",
+                  "Hypothyroidism",
+                  "LiverDisease",
+                  "PepticUlcer",
+                  "Lymphoma",
+                  "Cancer",
+                  "Tumor",
+                  "Arthritis",
+                  "Coagulopathy",
+                  "ElectrolyteDisorder",
+                  "DeficiencyAnemia",
+                  "DrugAbuse",
+                  "Psychoses",
+                  "Depression",
+                  "Male",
+                  "PADThresholdChangeInd",
+                  "Hypertension",
+                  "Diabetes")
+
+m3.cont_cols <- c("TotalHospitalAdmissionCount",
+                  "HeartFailureHospitalAdmissionCount",
+                  "SecondaryHFAdmissionCount",
+                  "Age",
+                  "LengthParticipation",
+                  "PA_Systolic_Min",
+                  "PA_Systolic_Max",
+                  "PA_Systolic_Mean",
+                  "PA_Diastolic_Min",
+                  "PA_Diastolic_Max",
+                  "PA_Diastolic_Mean",
+                  "PA_Pulsatility_Min",
+                  "PA_Pulsatility_Max",
+                  "PA_Pulsatility_Mean",
+                  "PA_Mean_Min",
+                  "PA_Mean_Max",
+                  "PA_Mean_Mean",
+                  "Heart_Rate_Min",
+                  "Heart_Rate_Max",
+                  "Heart_Rate_Mean",
+                  "PAD_Threshold_Range_Min",
+                  "PAD_Threshold_Range_Max",
+                  "PAD_Threshold_Range_Mean",
+                  "PA_Systolic_Diff",
+                  "PA_Diastolic_Diff",
+                  "PA_Pulsatility_Diff",
+                  "PA_Mean_Diff",
+                  "Heart_Rate_Diff",
+                  "PAD_Threshold_Range_Diff",
+                  "PAD_Flag_Scaled",
+                  "ThresholdChangeInd_Scaled",
+                  "MissedDays_Scaled")
+
+m3.cat_cols <- c("AverageDailyBPCategory",
+                 "BMICategory",
+                 "TobaccoUse",
+                 "EjectionFractionCat")
+
+```
+
+```{r Data Prep, echo=FALSE, warning=FALSE, message=FALSE}
+
+# Set the Boolean columns as factors
+for (col in m3.bool_cols) {
+    m3.cardiomems[[col]] <- as.factor(m3.cardiomems[[col]])
+}
+
+# Set the categorical columns as factors
+for (col in m3.cat_cols) {
+    m3.cardiomems[[col]] <- as.factor(m3.cardiomems[[col]])
+}
+
+# Set the response variable as a factor
+m3.cardiomems[[m3.dep_var]] <- as.factor(m3.cardiomems[[m3.dep_var]])
+levels(m3.cardiomems[[m3.dep_var]]) <- c("No", "Yes")
+
+# Split the data into train and test, and create an evenly scaled training set using
+# the ROSE package for an even number of AllAdmissions = 1 or 0
+set.seed(255)
+m3.idx <- createDataPartition(m3.cardiomems$IVDiuretic, p = 0.7, list = FALSE)
+m3.trn <- m3.cardiomems[m3.idx, ]
+m3.trn_scaled <- ROSE(IVDiuretic ~ ., data = m3.trn)$data
+m3.tst <- m3.cardiomems[-m3.idx, ]
+
+significant_pred_vars(m3.dep_var, m3.cont_cols, m3.cardiomems, FALSE)
+significant_pred_vars(m3.dep_var, m3.bool_cols, m3.cardiomems, TRUE)
+significant_pred_vars(m3.dep_var, m3.cat_cols, m3.cardiomems, TRUE)
+
+```
+
+```{r Logistic Caret CV, echo=FALSE, warning=FALSE, message=FALSE}
+
+m3.ctrl <- trainControl(method = "cv",
+                        number = 5,
+                        summaryFunction=twoClassSummary,
+                        classProbs=TRUE)
+
+m3.glm_mod <- train(
+  form = IVDiuretic ~ TotalHospitalAdmissionCount + HeartFailureHospitalAdmissionCount + SecondaryHFAdmissionCount +
+    PAD_Threshold_Range_Max + PA_Diastolic_Max + PAD_Flag_Scaled + Heart_Rate_Mean + AllAdmission + HFAdmission + 
+    Insulin + CPAPUsage + CongestiveHF + TobaccoUse + EjectionFractionCat,
+  data = m3.trn_scaled,
+  trControl = m3.ctrl,
+  method = "glm",
+  metric = "ROC",
+  family = "binomial"
+)
+
+m3.glm_mod$results
+
+broom::tidy(m3.glm_mod$finalModel) %>% 
+  arrange(p.value) %>% 
+  gt() %>%
+  fmt_number(columns = vars(estimate, std.error, statistic, p.value ), decimals = 4) %>% 
+  gtsave("m3.glm_mod_stats.rtf")
+
+m3.log_pred <- predict(m3.glm_mod, newdata = m3.tst)
+
+###################################################################
+
+step(glm(IVDiuretic ~ TotalHospitalAdmissionCount + HeartFailureHospitalAdmissionCount + SecondaryHFAdmissionCount +
+           PAD_Threshold_Range_Max + PA_Diastolic_Max + PAD_Flag_Scaled + Heart_Rate_Mean + AllAdmission + HFAdmission + 
+           Insulin + CPAPUsage + CongestiveHF + TobaccoUse + EjectionFractionCat, data = m3.trn_scaled, family = "binomial"))
+
+m3.glm_mod2 <- train(
+  form = IVDiuretic ~ TotalHospitalAdmissionCount + SecondaryHFAdmissionCount + HFAdmission + Insulin + CPAPUsage + EjectionFractionCat,
+  data = m3.trn_scaled,
+  trControl = m3.ctrl,
+  method = "glm",
+  metric = "ROC",
+  family = "binomial"
+)
+
+m3.glm_mod2$results
+
+broom::tidy(m3.glm_mod2$finalModel) %>% 
+  arrange(p.value) %>% 
+  gt() %>%
+  fmt_number(columns = vars(estimate, std.error, statistic, p.value ), decimals = 4) %>% 
+  gtsave("m3.glm_mod2_stats.rtf")
+
+m3.log_pred2 <- predict(m3.glm_mod2, newdata = m3.tst)
+calc_acc(actual <- m3.tst$IVDiuretic, predicted = m3.log_pred2)
+
+
+m3.glm_prob <- predict(m3.glm_mod, m3.tst, type = "prob")
+m3.glm_prob2 <- predict(m3.glm_mod2, m3.tst, type = "prob")
+
+m3.log_roc <- roc(predictor=m3.glm_prob$Yes,
+                  response=m3.tst$IVDiuretic,
+                  levels=rev(levels(m3.tst$IVDiuretic)))
+
+m3.log_roc2 <- roc(predictor=m3.glm_prob2$Yes,
+                   response=m3.tst$IVDiuretic,
+                   levels=rev(levels(m3.tst$IVDiuretic)))
+
+```
+
+```{r Random Forests Caret, echo=FALSE, message=FALSE, warning=FALSE}
+
+set.seed(255)
+
+m3.rf_ctrl <- trainControl(method = "cv",
+                           number = 5,
+                           summaryFunction=twoClassSummary,
+                           classProbs=TRUE,
+                           search="random")
+
+m3.rf <- train(IVDiuretic ~ ., 
+               data=m3.trn,
+               method="rf", 
+               metric="ROC",
+               trControl=m3.rf_ctrl,
+               tuneLength=15)
+
+print(m3.rf)
+plot(m3.rf)
+varImpPlot(m3.rf$finalModel)
+
+m3.rf_pred <- predict(m3.rf, newdata = m3.tst)
+m3.rf_prob <- predict(m3.rf, newdata = m3.tst, type = "prob")
+
+calc_acc(actual = m3.tst$IVDiuretic, predicted = m3.rf_pred)
+
+m3.rf_roc <- roc(predictor=m3.rf_prob$Yes,
+                  response=m3.tst$IVDiuretic,
+                  levels=rev(levels(m3.tst$IVDiuretic)))
+
+```
+
+
+```{r Boosting, echo=FALSE, message=FALSE, warning=FALSE}
+
+set.seed(255)
+
+m3.gbm_grid <- expand.grid(interaction.depth = 1:5,
+                          n.trees = (1:6) * 500,
+                          shrinkage = c(0.001, 0.01, 0.1),
+                          n.minobsinnode = 10)
+
+#############################################################
+# All predictors, unscaled
+
+m3.gbm <- train(IVDiuretic ~ ., data = m3.trn, 
+               method = "gbm",
+               metric = "ROC",
+               trControl = m3.ctrl,
+               verbose = FALSE,
+               tuneGrid = m3.gbm_grid)
+
+plot(m3.gbm)
+
+summary(m3.gbm)
+
+m3.gbm_pred <- predict(m3.gbm, m3.tst)
+calc_acc(m3.tst$IVDiuretic, m3.gbm_pred)
+
+m3.gbm_prob <- predict(m3.gbm, newdata = m3.tst, type = "prob")
+m3.gbm_roc <- roc(predictor=m3.gbm_prob$Yes,
+                  response=m3.tst$IVDiuretic,
+                  levels=rev(levels(m3.tst$IVDiuretic)))
+
+#############################################################
+# All predictors, scaled
+
+m3.gbm_scaled <- train(IVDiuretic ~ ., data = m3.trn_scaled, 
+                       method = "gbm",
+                       metric = "ROC",
+                       trControl = m3.ctrl,
+                       verbose = FALSE,
+                       tuneGrid = m3.gbm_grid)
+
+plot(m3.gbm_scaled)
+summary(m3.gbm_scaled)
+
+m3.gbm_scaled_pred <- predict(m3.gbm_scaled, m3.tst)
+calc_acc(m3.tst$IVDiuretic, m3.gbm_scaled_pred)
+
+m3.gbm_scaled_prob <- predict(m3.gbm_scaled, newdata = m3.tst, type = "prob")
+m3.gbm_scaled_roc <- roc(predictor=m3.gbm_scaled_prob$Yes,
+                         response=m3.tst$IVDiuretic,
+                         levels=rev(levels(m3.tst$IVDiuretic)))
+
+#############################################################
+# Feature selection, unscaled
+
+m3.gbm_fs <- train(IVDiuretic ~ TotalHospitalAdmissionCount + HeartFailureHospitalAdmissionCount + SecondaryHFAdmissionCount +
+                     PAD_Threshold_Range_Max + PA_Diastolic_Max + PAD_Flag_Scaled + Heart_Rate_Mean + AllAdmission + HFAdmission + 
+                     Insulin + CPAPUsage + CongestiveHF + TobaccoUse + EjectionFractionCat,
+                   data = m3.trn,
+                   method = "gbm",
+                   metric = "ROC",
+                   trControl = m3.ctrl,
+                   verbose = FALSE,
+                   tuneGrid = m3.gbm_grid)
+
+plot(m3.gbm_fs)
+
+summary(m3.gbm_fs)
+m3.gbm_fs_pred <- predict(m3.gbm_fs, m3.tst)
+calc_acc(m3.tst$IVDiuretic, m3.gbm_fs_pred)
+
+m3.gbm_fs_prob <- predict(m3.gbm_fs, newdata = m3.tst, type = "prob")
+m3.gbm_fs_roc <- roc(predictor=m3.gbm_fs_prob$Yes,
+                     response=m3.tst$IVDiuretic,
+                     levels=rev(levels(m3.tst$IVDiuretic)))
+
+#############################################################
+# Feature selection, scaled
+
+m3.gbm_fs_scaled <- train(IVDiuretic ~ TotalHospitalAdmissionCount + HeartFailureHospitalAdmissionCount + SecondaryHFAdmissionCount +
+                            PAD_Threshold_Range_Max + PA_Diastolic_Max + PAD_Flag_Scaled + Heart_Rate_Mean + AllAdmission + HFAdmission +
+                            Insulin + CPAPUsage + CongestiveHF + TobaccoUse + EjectionFractionCat,
+                          data = m3.trn_scaled,
+                          method = "gbm",
+                          metric = "ROC",
+                          trControl = m3.ctrl,
+                          verbose = FALSE,
+                          tuneGrid = m3.gbm_grid)
+
+plot(m3.gbm_fs_scaled)
+summary(m3.gbm_fs_scaled)
+
+m3.gbm_fs_scaled_pred <- predict(m3.gbm_fs_scaled, m3.tst)
+calc_acc(m3.tst$IVDiuretic, m3.gbm_fs_scaled_pred)
+
+m3.gbm_fs_scaled_prob <- predict(m3.gbm_fs_scaled, newdata = m3.tst, type = "prob")
+m3.gbm_fs_scaled_roc <- roc(predictor=m3.gbm_fs_scaled_prob$Yes,
+                            response=m3.tst$IVDiuretic,
+                            levels=rev(levels(m3.tst$IVDiuretic)))
+
+#############################################################
+
+plot.roc(m3.gbm_roc, col = laxMaroon, lty = 1, lwd = 3)
+plot.roc(m3.gbm_scaled_roc, col = laxGray, lwd = 3, lty = 2, add = TRUE)
+plot.roc(m3.gbm_fs_roc, col = "black", lwd = 3, lty = 3, add = TRUE)
+plot.roc(m3.gbm_fs_scaled_roc, col = "#856C00", lwd = 3, lty = 4, add = TRUE)
+legend("bottomright", 
+       legend=c(paste("All Predictors, Unscaled; AUC=", round(m3.gbm_roc$auc,3)), 
+                paste("All Predictors, Scaled; AUC=", round(m3.gbm_scaled_roc$auc,3)),
+                paste("Feature Selection, Unscaled; AUC=", round(m3.gbm_fs_roc$auc,3)),
+                paste("Feature Selection, Scaled; AUC=", round(m3.gbm_fs_scaled_roc$auc,3))),
+                lty=c(1,2, 3, 4), lwd = 3,
+                col=c(laxMaroon, laxGray, "black","#856C00"))
+
+m3.gbm_roc$auc
+m3.gbm_scaled_roc$auc
+m3.gbm_fs_roc$auc
+m3.gbm_fs_scaled_roc$auc
+```
+
+
+```{r Plots, echo=FALSE, warning=FALSE, message=FALSE}
+
+op <- par()
+par(mfrow=c(2,2))
+plot.roc(m3.log_roc, col = laxMaroon, print.auc = TRUE, main="Initial Logistic Regression")
+plot.roc(m3.log_roc2, col=laxMaroon, print.auc = TRUE, main="Parsimonious Logistic Regression")
+plot.roc(m3.rf_roc, col=laxMaroon, print.auc = TRUE, main="Random Forest")
+plot.roc(m3.gbm_fs_scaled_roc, col = laxMaroon, print.auc = TRUE, main="Boosting (FS & Scaled)")
+par(op)
+
+```
+```{r Predictor Variable Comparison, warning=FALSE, message=FALSE}
+
+broom::tidy(m3.glm_mod2$finalModel) %>% arrange(p.value) %>% top_n(10) %>% select(term)
+importance(m3.rf$finalModel) %>% as.data.frame() %>% arrange(desc(MeanDecreaseGini)) %>% top_n(10) %>% select(-"MeanDecreaseGini")
+summary(m3.gbm_fs_scaled) %>% arrange(desc(rel.inf)) %>% top_n(10) %>% select(-c("var", "rel.inf"))
+
+m3.log_roc$auc %>% round(3) %>% right(5) %>% as.numeric()
+m3.log_roc2$auc %>% round(3) %>% right(5) %>% as.numeric()
+m3.rf_roc$auc %>% round(3) %>% right(5) %>% as.numeric()
+m3.gbm_roc$auc %>% round(3) %>% right(5) %>% as.numeric()
+m3.gbm_fs_roc$auc %>% round(3) %>% right(5) %>% as.numeric()
+m3.gbm_scaled_roc$auc %>% round(3) %>% right(5) %>% as.numeric()
+m3.gbm_fs_scaled_roc$auc %>% round(3) %>% right(5) %>% as.numeric()
+
+```

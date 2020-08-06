@@ -1,0 +1,395 @@
+---
+title: "CardioMEMS Model 1 - All-cause Hospitalization"
+author: "Mark Riley"
+date: "8/5/2020"
+output: word_document
+---
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("~/Dropbox/UWLax/DS785/Data")
+
+require(tidyverse) # For data manipulation
+require(gt) # For pretty tables
+require(leaps) # Subsets
+require(broom) # Nice summary tables
+require(gt) # Pretty tables
+require(randomForest) # Random Forest
+require(gbm) # Boosting
+require(caret) # Test, train split and cross validation
+require(ROSE) # balancing the training dataset
+require(pROC) # ROC-AUC
+
+# Go Eagles! UW-La Crosse school colors
+laxMaroon = "#830019"
+laxGray = "#969799"
+
+# Load the data
+cardiomems <- read_csv("cardiomems_full_dataset.csv")
+
+# Drop columns that have no predictive value or are directly related to/derived from the dependent var
+cardiomems <- cardiomems %>% select(-one_of("HFAdmission",
+                                            "ID",
+                                            "TotalHospitalAdmissionCount",
+                                            "HeartFailureHospitalAdmissionCount",
+                                            "SecondaryHFAdmissionCount"))
+
+m1.dep_var <- "AllAdmission"
+
+```
+
+```{r Column Names, echo=FALSE, warning=FALSE, message=FALSE}
+
+# Get all the boolean column names that can be used as predictors
+m1.bool_cols <- c("IVDiuretic",
+                  "Obesity",
+                  "Diabetes",
+                  "CoronaryArteryDisease",
+                  "ValvularHeartDisease",
+                  "HighCholesterol",
+                  "AlcoholAbuse",
+                  "SleepApnea",
+                  "CPAPUsage",
+                  "RenalFailure",
+                  "Insulin",
+                  "RaceWhite",
+                  "SGLT2",
+                  "Metformin",
+                  "DPPV4",
+                  "GLP1",
+                  "CongestiveHF",
+                  "PulmonaryCirculation",
+                  "PeripheralVascular",
+                  "NeurologicalDisorder",
+                  "ChronicPulmonary",
+                  "Hypothyroidism",
+                  "LiverDisease",
+                  "PepticUlcer",
+                  "Lymphoma",
+                  "Cancer",
+                  "Tumor",
+                  "Arthritis",
+                  "Coagulopathy",
+                  "ElectrolyteDisorder",
+                  "DeficiencyAnemia",
+                  "DrugAbuse",
+                  "Psychoses",
+                  "Depression",
+                  "Male",
+                  "PADThresholdChangeInd",
+                  "Hypertension")
+
+m1.cont_cols <- c("Age",
+                  "LengthParticipation",
+                  "PA_Systolic_Min",
+                  "PA_Systolic_Max",
+                  "PA_Systolic_Mean",
+                  "PA_Diastolic_Min",
+                  "PA_Diastolic_Max",
+                  "PA_Diastolic_Mean",
+                  "PA_Pulsatility_Min",
+                  "PA_Pulsatility_Max",
+                  "PA_Pulsatility_Mean",
+                  "PA_Mean_Min",
+                  "PA_Mean_Max",
+                  "PA_Mean_Mean",
+                  "Heart_Rate_Min",
+                  "Heart_Rate_Max",
+                  "Heart_Rate_Mean",
+                  "PAD_Threshold_Range_Min",
+                  "PAD_Threshold_Range_Max",
+                  "PAD_Threshold_Range_Mean",
+                  "PA_Systolic_Diff",
+                  "PA_Diastolic_Diff",
+                  "PA_Pulsatility_Diff",
+                  "PA_Mean_Diff",
+                  "Heart_Rate_Diff",
+                  "PAD_Threshold_Range_Diff",
+                  "PAD_Flag_Scaled",
+                  "ThresholdChangeInd_Scaled",
+                  "MissedDays_Scaled")
+
+m1.cat_cols <- c("AverageDailyBPCategory",
+                 "BMICategory",
+                 "TobaccoUse",
+                 "EjectionFractionCat")
+
+```
+
+```{r Data Prep, echo=FALSE, warning=FALSE, message=FALSE}
+
+# Set the Boolean columns as factors
+for (col in m1.bool_cols) {
+    cardiomems[[col]] <- as.factor(cardiomems[[col]])
+}
+
+# Set the categorical columns as factors
+for (col in m1.cat_cols) {
+    cardiomems[[col]] <- as.factor(cardiomems[[col]])
+}
+
+# Set the response variable as a factor
+cardiomems[[m1.dep_var]] <- as.factor(cardiomems[[m1.dep_var]])
+levels(cardiomems[[m1.dep_var]]) <- c("No", "Yes")
+
+# Split the data into train and test, and create an evenly scaled training set using
+# the ROSE package for an even number of AllAdmissions = 1 or 0
+set.seed(255)
+
+m1.idx <- createDataPartition(cardiomems$AllAdmission, p = 0.7, list = FALSE)
+m1.trn <- cardiomems[m1.idx, ]
+m1.trn_scaled <- ROSE(AllAdmission ~ ., data = m1.trn)$data
+m1.tst <- cardiomems[-m1.idx, ]
+
+significant_pred_vars(m1.dep_var, m1.cont_cols, cardiomems, FALSE)
+significant_pred_vars(m1.dep_var, m1.bool_cols, cardiomems, TRUE)
+significant_pred_vars(m1.dep_var, m1.cat_cols, cardiomems, TRUE)
+
+```
+
+```{r Logistic Caret CV, echo=FALSE, warning=FALSE, message=FALSE}
+
+m1.ctrl <- trainControl(method = "cv",
+                        number = 5,
+                        summaryFunction=twoClassSummary,
+                        classProbs=TRUE)
+
+m1.glm_mod <- train(
+  form = AllAdmission ~ MissedDays_Scaled + PAD_Threshold_Range_Max + CongestiveHF + CPAPUsage + 
+    IVDiuretic + Insulin + Diabetes + EjectionFractionCat + TobaccoUse,
+  data = m1.trn_scaled,
+  trControl = m1.ctrl,
+  method = "glm",
+  metric = "ROC",
+  family = "binomial"
+)
+
+m1.glm_mod$results
+
+broom::tidy(m1.glm_mod$finalModel) %>% 
+  arrange(p.value) %>% 
+  gt() %>%
+  fmt_number(columns = vars(estimate, std.error, statistic, p.value ), decimals = 4) %>% 
+  gtsave("m1.glm_mod_stats.rtf")
+
+m1.log_pred <- predict(m1.glm_mod, newdata = m1.tst)
+
+###################################################################
+
+step(glm(AllAdmission ~ MissedDays_Scaled + PAD_Threshold_Range_Max + CongestiveHF + CPAPUsage + 
+    IVDiuretic + Insulin + Diabetes + EjectionFractionCat + TobaccoUse, data = m1.trn_scaled, family = "binomial"))
+
+m1.glm_mod2 <- train(
+  form = AllAdmission ~ IVDiuretic + TobaccoUse,
+  data = m1.trn_scaled,
+  trControl = m1.ctrl,
+  method = "glm",
+  metric = "ROC",
+  family = "binomial"
+)
+
+m1.glm_mod2$results
+
+broom::tidy(m1.glm_mod2$finalModel) %>% 
+  arrange(p.value) %>% 
+  gt() %>%
+  fmt_number(columns = vars(estimate, std.error, statistic, p.value ), decimals = 4) %>% 
+  gtsave("m1.glm_mod2_stats.rtf")
+
+m1.log_pred2 <- predict(m1.glm_mod2, newdata = m1.tst)
+calc_acc(actual <- m1.tst$AllAdmission, predicted = m1.log_pred2)
+
+
+m1.glm_prob <- predict(m1.glm_mod, m1.tst, type = "prob")
+m1.glm_prob2 <- predict(m1.glm_mod2, m1.tst, type = "prob")
+
+m1.log_roc <- roc(predictor=m1.glm_prob$Yes,
+                  response=m1.tst$AllAdmission,
+                  levels=rev(levels(m1.tst$AllAdmission)))
+
+m1.log_roc2 <- roc(predictor=m1.glm_prob2$Yes,
+                   response=m1.tst$AllAdmission,
+                   levels=rev(levels(m1.tst$AllAdmission)))
+
+```
+
+```{r Random Forests Caret, echo=FALSE, message=FALSE, warning=FALSE}
+
+set.seed(255)
+
+m1.rf_ctrl <- trainControl(method = "cv",
+                           number = 5,
+                           summaryFunction=twoClassSummary,
+                           classProbs=TRUE,
+                           search="random")
+
+m1.rf <- train(AllAdmission ~ ., 
+               data=m1.trn,
+               method="rf", 
+               metric="ROC",
+               trControl=m1.rf_ctrl,
+               tuneLength=15)
+
+print(m1.rf)
+plot(m1.rf)
+varImpPlot(m1.rf$finalModel)
+
+m1.rf_pred <- predict(m1.rf, newdata = m1.tst)
+m1.rf_prob <- predict(m1.rf, newdata = m1.tst, type = "prob")
+
+calc_acc(actual = m1.tst$AllAdmission, predicted = m1.rf_pred)
+
+m1.rf_roc <- roc(predictor=m1.rf_prob$Yes,
+                  response=m1.tst$AllAdmission,
+                  levels=rev(levels(m1.tst$AllAdmission)))
+
+```
+
+
+```{r Boosting, echo=FALSE, message=FALSE, warning=FALSE}
+
+set.seed(255)
+
+m1.gbm_grid <- expand.grid(interaction.depth = 1:5,
+                          n.trees = (1:6) * 500,
+                          shrinkage = c(0.001, 0.01, 0.1),
+                          n.minobsinnode = 10)
+
+#############################################################
+# All predictors, unscaled
+
+m1.gbm <- train(AllAdmission ~ ., data = m1.trn, 
+               method = "gbm",
+               metric = "ROC",
+               trControl = m1.ctrl,
+               verbose = FALSE,
+               tuneGrid = m1.gbm_grid)
+
+plot(m1.gbm)
+summary(m1.gbm)
+
+m1.gbm_pred <- predict(m1.gbm, m1.tst)
+calc_acc(m1.tst$AllAdmission, m1.gbm_pred)
+
+m1.gbm_prob <- predict(m1.gbm, newdata = m1.tst, type = "prob")
+m1.gbm_roc <- roc(predictor=m1.gbm_prob$Yes,
+                  response=m1.tst$AllAdmission,
+                  levels=rev(levels(m1.tst$AllAdmission)))
+
+#############################################################
+# All predictors, scaled
+
+m1.gbm_scaled <- train(AllAdmission ~ ., data = m1.trn_scaled, 
+                       method = "gbm",
+                       metric = "ROC",
+                       trControl = m1.ctrl,
+                       verbose = FALSE,
+                       tuneGrid = m1.gbm_grid)
+
+plot(m1.gbm_scaled)
+summary(m1.gbm_scaled)
+
+m1.gbm_scaled_pred <- predict(m1.gbm_scaled, m1.tst)
+calc_acc(m1.tst$AllAdmission, m1.gbm_scaled_pred)
+
+m1.gbm_scaled_prob <- predict(m1.gbm_scaled, newdata = m1.tst, type = "prob")
+m1.gbm_scaled_roc <- roc(predictor=m1.gbm_scaled_prob$Yes,
+                         response=m1.tst$AllAdmission,
+                         levels=rev(levels(m1.tst$AllAdmission)))
+
+#############################################################
+# Feature selection, unscaled
+
+m1.gbm_fs <- train(AllAdmission ~ MissedDays_Scaled + PAD_Threshold_Range_Max + CongestiveHF + CPAPUsage +
+                     IVDiuretic + Insulin + Diabetes + EjectionFractionCat + TobaccoUse,
+                   data = m1.trn,
+                   method = "gbm",
+                   metric = "ROC",
+                   trControl = m1.ctrl,
+                   verbose = FALSE,
+                   tuneGrid = m1.gbm_grid)
+
+plot(m1.gbm_fs)
+summary(m1.gbm_fs)
+
+m1.gbm_fs_pred <- predict(m1.gbm_fs, m1.tst)
+calc_acc(m1.tst$AllAdmission, m1.gbm_fs_pred)
+
+m1.gbm_fs_prob <- predict(m1.gbm_fs, newdata = m1.tst, type = "prob")
+m1.gbm_fs_roc <- roc(predictor=m1.gbm_fs_prob$Yes,
+                     response=m1.tst$AllAdmission,
+                     levels=rev(levels(m1.tst$AllAdmission)))
+
+#############################################################
+# Feature selection, scaled
+
+m1.gbm_fs_scaled <- train(AllAdmission ~ MissedDays_Scaled + PAD_Threshold_Range_Max + CongestiveHF + CPAPUsage +
+                            IVDiuretic + Insulin + Diabetes + EjectionFractionCat + TobaccoUse,
+                          data = m1.trn_scaled,
+                          method = "gbm",
+                          metric = "ROC",
+                          trControl = m1.ctrl,
+                          verbose = FALSE,
+                          tuneGrid = m1.gbm_grid)
+
+plot(m1.gbm_fs_scaled)
+summary(m1.gbm_fs_scaled)
+
+m1.gbm_fs_scaled_pred <- predict(m1.gbm_fs_scaled, m1.tst)
+calc_acc(m1.tst$AllAdmission, m1.gbm_fs_scaled_pred)
+
+m1.gbm_fs_scaled_prob <- predict(m1.gbm_fs_scaled, newdata = m1.tst, type = "prob")
+m1.gbm_fs_scaled_roc <- roc(predictor=m1.gbm_fs_scaled_prob$Yes,
+                            response=m1.tst$AllAdmission,
+                            levels=rev(levels(m1.tst$AllAdmission)))
+
+#############################################################
+
+plot.roc(m1.gbm_roc, col = laxMaroon, lty = 1, lwd = 3)
+plot.roc(m1.gbm_scaled_roc, col = laxGray, lwd = 3, lty = 2, add = TRUE)
+plot.roc(m1.gbm_fs_roc, col = "black", lwd = 3, lty = 3, add = TRUE)
+plot.roc(m1.gbm_fs_scaled_roc, col = "#856C00", lwd = 3, lty = 4, add = TRUE)
+legend("bottomright", 
+       legend=c(paste("All Predictors, Unscaled; AUC=", round(m1.gbm_roc$auc,3)), 
+                paste("All Predictors, Scaled; AUC=", round(m1.gbm_scaled_roc$auc,3)),
+                paste("Feature Selection, Unscaled; AUC=", round(m1.gbm_fs_roc$auc,3)),
+                paste("Feature Selection, Scaled; AUC=", round(m1.gbm_fs_scaled_roc$auc,3))),
+                lty=c(1,2, 3, 4), lwd = 3,
+                col=c(laxMaroon, laxGray, "black","#856C00"))
+
+m1.gbm_roc$auc
+m1.gbm_scaled_roc$auc
+m1.gbm_fs_roc$auc
+m1.gbm_fs_scaled_roc$auc
+```
+
+
+```{r Plots, echo=FALSE, warning=FALSE, message=FALSE}
+
+op <- par()
+par(mfrow=c(2,2))
+plot.roc(m1.log_roc, col = laxMaroon, print.auc = TRUE, main="Initial Logistic Regression")
+plot.roc(m1.log_roc2, col=laxMaroon, print.auc = TRUE, main="Parsimonious Logistic Regression")
+plot.roc(m1.rf_roc, col=laxMaroon, print.auc = TRUE, main="Random Forest")
+plot.roc(m1.gbm_roc, col = laxMaroon, print.auc = TRUE, main="Boosting (Unscaled)")
+par(op)
+
+```
+
+```{r Predictor Variable Comparison, warning=FALSE, message=FALSE}
+
+broom::tidy(m1.glm_mod$finalModel) %>% arrange(p.value) %>% top_n(10) %>% select(term)
+importance(m1.rf$finalModel) %>% as.data.frame() %>% arrange(desc(MeanDecreaseGini)) %>% top_n(10) %>% select(-"MeanDecreaseGini")
+summary(m1.gbm) %>% arrange(desc(rel.inf)) %>% top_n(10) %>% select(-c("var", "rel.inf"))
+summary(m1.gbm_fs) %>% arrange(desc(rel.inf)) %>% top_n(10) %>% select(-c("var", "rel.inf"))
+
+m1.log_roc$auc %>% round(3) %>% right(5) %>% as.numeric()
+m1.log_roc2$auc %>% round(3) %>% right(5) %>% as.numeric()
+m1.rf_roc$auc %>% round(3) %>% right(5) %>% as.numeric()
+m1.gbm_roc$auc %>% round(3) %>% right(5) %>% as.numeric()
+m1.gbm_fs_roc$auc %>% round(3) %>% right(5) %>% as.numeric()
+m1.gbm_scaled_roc$auc %>% round(3) %>% right(5) %>% as.numeric()
+m1.gbm_fs_scaled_roc$auc %>% round(3) %>% right(5) %>% as.numeric()
+
+```

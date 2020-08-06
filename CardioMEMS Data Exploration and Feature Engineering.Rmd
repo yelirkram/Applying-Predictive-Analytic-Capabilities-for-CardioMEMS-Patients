@@ -1,0 +1,1080 @@
+---
+title: "CardioMEMS Data Exploration and Feature Engineering"
+author: "Mark Riley"
+date: "8/5/2020"
+output: word_document
+---
+
+```{r setup, echo=FALSE, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("~/Dropbox/UWLax/DS785/Data")
+
+require(tidyverse) # For data manipulation
+require(readr) # For loading csv data
+require(ggformula) # For graphing results
+require(lubridate) # For converting dates
+require(gt) # For pretty tables
+require(glue) # Also for pretty tables
+require(mice) # For imputing missing values
+
+# Go Eagles! UW-La Crosse school colors
+laxMaroon = "#830019"
+laxGray = "#969799"
+
+# Load the data
+device <- read_csv("device.csv")
+risks <- read_csv("risk_factors.csv")
+
+# Change NULL values to NA
+risks[risks == "NULL"] = NA
+
+# Change the date time to date time format
+device$MeasurementDT_UTC <- ymd_hms(device$MeasurementDT_UTC)
+
+# Change the threshold columns to numeric
+device <- device %>% 
+  mutate_at(c("PA_Diastolic_Threshold_Lower", "PA_Diastolic_Threshold_Upper"), as.numeric)
+
+due_date <- as.Date.POSIXct("2020-08-05", tz="EDT")
+today_date <- today(tz="EDT")
+days_due <- as.period(today_date %--% due_date)
+weeks_due <- round(days_due$day/7,2)
+print(paste("You have ", days_due, " (", weeks_due, " weeks) until the final paper is due!", sep = ""))
+
+```
+
+# CardioMEMS Device Data Exporatory Analysis
+
+## Device Continuous Data
+
+```{r device continuous data exploration, message=FALSE, warning=FALSE, echo=FALSE}
+# Sumarize the number of readings per patient
+print("Summary of the number of CardioMEMS device readings per patient:")
+device_by_id <- device %>% group_by(ID) %>% tally()
+summary(device_by_id$n)
+
+# White space
+cat("\n") 
+
+# Get the earliest and latest measurement dates
+device_start_dt <- as.Date(min(device$MeasurementDT_UTC))
+device_end_dt <- as.Date(max(device$MeasurementDT_UTC))
+                       
+print(paste("The earliest CardioMEMS readings are from", device_start_dt,
+            "and the latest CardioMEMS readings are from", device_end_dt))
+
+# White space
+cat("\n") 
+
+# Get the month and year of each measurement value
+counts_by_mo_yr <- device %>% 
+  mutate(monthyear = paste(year(MeasurementDT_UTC), "-", right(paste("0",month(MeasurementDT_UTC),sep=""), 2), sep="")) %>% 
+  select(monthyear)
+
+# Graph measurement date values
+ggplot(data = counts_by_mo_yr, aes(x = monthyear)) +
+  geom_histogram(aes(fill = ..count..), stat = "count") +
+  theme(legend.position = "none", panel.background = element_blank(), axis.text.x = element_text(angle = 45)) +
+  xlab("Month") + ylab("Number of Measurements") + ggtitle("CardioMEMS Measurements by Month") +
+  scale_fill_gradient(low = laxGray, high = laxMaroon)
+
+# Create dataframe to store the statistics for continuous variables
+device_cont_stats <- data.frame(
+  FieldName = character(),
+  Max = integer(),
+  Min = integer(),
+  Mean = double(),
+  StdDev = double(),
+  NumNA = integer(),
+  NormalDist = logical(),
+  NumHighOutliers = integer(),
+  NumLowOutliers = integer()
+)
+
+device_cont_cols <- c("PA_Systolic",
+                      "PA_Diastolic",
+                      "PA_Pulsatility",
+                      "PA_Mean",
+                      "Heart_Rate",
+                      "PA_Diastolic_Threshold_Lower",
+                      "PA_Diastolic_Threshold_Upper")
+
+# Loop through each column in the device dataframe and explore the values
+for (col in device_cont_cols) {
+  z <- cont_desc_analysis(device[[col]], col)
+  device_cont_stats <- rbind.data.frame(device_cont_stats, z)
+}
+
+# Display the results of the descriptive analysis for the
+# continuous variables from the CardioMEMS device
+device_cont_stats %>%
+  gt() %>%
+  tab_header(
+    title = "CardioMEMS Device Dataset Summary",
+    subtitle = glue::glue("{device_start_dt} to {device_end_dt}")
+  ) %>%
+  fmt_number(
+    columns = vars(Max, Min, IQR, Median, StdDev, NumNA, NumHighOutliers, NumLowOutliers),
+    suffixing = TRUE
+  ) %>% 
+  gtsave("device cont var stats.rtf")
+
+```
+
+## Device Continuous Columns Feature Engineering
+
+```{r Device Continuous Feature Engineering, message=FALSE, warning=FALSE, echo=FALSE}
+# Get IDs with NA threshold values
+pad_threshold_na <- device %>% 
+  filter(is.na(PA_Diastolic_Threshold_Upper)) %>% 
+  group_by(ID) %>% 
+  tally()
+
+pad_threshold_na[1] # Display IDs with missing thresholds
+
+# Pivot Table of the values for upper and lower thresholds for patients that have some NA values
+device %>% 
+  inner_join(pad_threshold_na) %>% 
+  select(ID, PA_Diastolic_Threshold_Upper, PA_Diastolic_Threshold_Lower) %>% 
+  group_by(ID, PA_Diastolic_Threshold_Upper, PA_Diastolic_Threshold_Lower) %>% tally()
+
+# Get the data for one patient at a time for analysis
+device %>% 
+  mutate(m_date = date(device$MeasurementDT_UTC)) %>% 
+  filter(ID == 35987, m_date > as.Date("2010-1-1"), m_date < as.Date("2020-12-31")) %>% 
+  select(PA_Diastolic, PA_Diastolic_Threshold_Lower, PA_Diastolic_Threshold_Upper, m_date) %>% 
+  arrange(m_date)
+
+## Normal range for PA pressure
+# Systolic (PASP) 15 - 30 mmHg
+# Diastolic (PADP) 8 - 15 mmHg
+# Mean Pulmonary Artery Pressure (MPAP) PASP + (2 x PADP)/3 9 - 18 mmHg
+
+# Create a vector of patient IDs that are only missing thresholds values
+# from the beginning of their records and set those missing values to
+# the first non-missing values
+fix_start_thres_ids <- c(28829, 29263, 29551, 50920, 160269, 272273)
+
+# Loop through each of the IDs in the list above and get the first non-NA
+# values in that patient's record, then update the NA values to the same
+# upper and lower thresholds
+for(my_id in fix_start_thres_ids) {
+  # Get the first non-NA lower threshold
+  fix_lower_thres <- device %>% 
+    filter(ID == my_id, !is.na(PA_Diastolic_Threshold_Lower)) %>% slice(1) %>% 
+    select(PA_Diastolic_Threshold_Lower) 
+  
+  # Get the first non-NA upper threshold
+  fix_upper_thres <- device %>% 
+    filter(ID == my_id, !is.na(PA_Diastolic_Threshold_Upper)) %>% slice(1) %>% 
+    select(PA_Diastolic_Threshold_Upper)
+  
+  # Update the NA lower threshold values
+  device <- device %>% 
+    mutate(PA_Diastolic_Threshold_Lower = if_else((ID = my_id & is.na(PA_Diastolic_Threshold_Lower)), 
+                                                  fix_lower_thres[[1]], 
+                                                  PA_Diastolic_Threshold_Lower))
+  # Update the NA upper threshold values
+  device <- device %>% 
+    mutate(PA_Diastolic_Threshold_Upper = if_else((ID = my_id & is.na(PA_Diastolic_Threshold_Upper)), 
+                                                  fix_upper_thres[[1]], 
+                                                  PA_Diastolic_Threshold_Upper))
+}
+
+# These patients are missing all their PA thresholds or are missing some in the
+# middle. Per the clinical team, use the default threshold values of 8 for lower
+# and 20 for upper to  replace NA values
+default_pa_thres_lower <- 8
+default_pa_thres_upper <- 20
+fix_mid_thres_ids <- c(35987, 38460)
+
+for(my_id in fix_mid_thres_ids) {
+  # Update the NA upper threshold values
+  device <- device %>% 
+    mutate(PA_Diastolic_Threshold_Lower = if_else((ID = my_id & is.na(PA_Diastolic_Threshold_Lower)), 
+                                                  default_pa_thres_lower, 
+                                                  PA_Diastolic_Threshold_Lower))
+  
+  # Update the NA upper threshold values
+  device <- device %>% 
+    mutate(PA_Diastolic_Threshold_Upper = if_else((ID = my_id & is.na(PA_Diastolic_Threshold_Upper)), 
+                                                  default_pa_thres_upper, 
+                                                  PA_Diastolic_Threshold_Upper))
+}
+
+# Adjust one patient with mistake PA_Diastolic_Threshold_Upper of 120. Should be 20
+device <- device %>%
+  mutate(PA_Diastolic_Threshold_Upper = ifelse(
+    (ID == 29884 & PA_Diastolic_Threshold_Upper == 120), 20, PA_Diastolic_Threshold_Upper))
+
+# Reset the PAD Flag, which denotes if the PA Diastolic pressure
+# is greater than or lower than the threshold values. Need to do this
+# after fixing the thresholds
+pad_flag_ids <- c(fix_mid_thres_ids, fix_start_thres_ids, 29884) # Get IDs for patients who had thresholds adjusted
+
+# Get the tally of 1s and 0s before fixing
+device %>% filter(ID %in% pad_flag_ids) %>% group_by(PAD_Flag) %>% tally()
+
+# Update the PAD_Flag field based on the fixed thresholds
+device <- device %>% 
+  mutate(PAD_Flag = ifelse(ID %in% pad_flag_ids & 
+                             (PA_Diastolic > PA_Diastolic_Threshold_Upper | 
+                                PA_Diastolic < PA_Diastolic_Threshold_Lower), 1, 0))
+
+# Get the tally of 1s and 0s after fixing
+device %>% filter(ID %in% pad_flag_ids) %>% group_by(PAD_Flag) %>% tally()
+
+# Get the total percentage of PD_Flags that are TRUE from all the data
+device %>% group_by(PAD_Flag) %>% tally()
+
+# Get a record of all the threshold indicators = 1/True before updates 
+pad_thres_tally <- device %>% filter(ThresholdChangeIndicator == 1) %>% group_by(ID) %>% tally() %>% arrange(desc(n))
+pad_thres_tally
+sum(pad_thres_tally$n)
+
+# We only  want the threshold change indicator to be TRUE if the upper or lower
+# threshold has changed by more than one. This gets rid of minor threshold changes
+# and one particular patient where the lower threshold toggled back and forth multiple
+# times between consecutive measurements. 
+device <- device %>% 
+  arrange(ID, MeasurementDT_UTC) %>% # Order the rows by ID and measure date
+  mutate(prev_lower = lag(PA_Diastolic_Threshold_Lower), # Get one row previous lower threshold
+         prev_upper = lag(PA_Diastolic_Threshold_Upper), # Get one row previous upper threshold
+         prev_id = lag(ID), # Get one row previous ID
+         ThresholdChangeIndicator = ifelse( # Create a new ThresholdChangeIndicator field
+           !is.na(prev_lower) & # Make sure each of the lag rows is not NA
+             !is.na(prev_upper) &
+             !is.na(prev_id) &
+             ID == prev_id & # Make sure the IDs match so the IND does not change on patient ID change
+             (PA_Diastolic_Threshold_Lower - prev_lower > 1 | #
+             prev_lower - PA_Diastolic_Threshold_Lower > 1 |
+               PA_Diastolic_Threshold_Upper - prev_upper > 1 |
+               prev_upper - PA_Diastolic_Threshold_Upper > 1),
+           1, # This is the same patient and the upper or lower thres has changed by more than 1
+           0) # Else no change of more than 1
+         )
+
+# Get a record of all the threshold indicators = 1/True after updates 
+pad_thres_tally <- device %>% filter(ThresholdChangeIndicator == 1) %>% group_by(ID) %>% tally() %>% arrange(desc(n))
+pad_thres_tally
+sum(pad_thres_tally$n)
+
+# Drop the new columns we created
+device <- device %>% select(-one_of(c("prev_lower", "prev_upper", "prev_id")))
+
+#~~~~~~~~~ July 28 Change ~~~~~~~~~#
+# Calculate the PA Diastolic Threshold Range for each reading and drop
+# The Upper and Lower Threshold columns
+device <- device %>% 
+  mutate(PAD_Threshold_Range = (PA_Diastolic_Threshold_Upper - PA_Diastolic_Threshold_Lower)) %>% 
+  select(-one_of("PA_Diastolic_Threshold_Lower", "PA_Diastolic_Threshold_Upper"))
+
+# Drop the upper and lower thresholds from the continuous columns
+device_cont_cols <- device_cont_cols[!device_cont_cols %in% c("PA_Diastolic_Threshold_Lower", "PA_Diastolic_Threshold_Upper")]
+
+# Add in the threshold range column and missed days column
+device_cont_cols <- c(device_cont_cols, "PAD_Threshold_Range", "MissedDays")
+
+# Calculate the number of days that  a patient missed doing their readings
+# from their CardioMEMS device. It has been shown that missed readings are
+# correlated with  hospitalizations and 
+device <- device %>% 
+  arrange(ID, MeasurementDT_UTC) %>% # Order the rows by ID and measure date
+  mutate(prev_date = lag(MeasurementDT_UTC), # Get previous row date
+         prev_id = lag(ID), # Get previous row ID to make sure we have not changed patients
+         date_diff = as.integer(floor(difftime(ymd_hms(MeasurementDT_UTC), ymd_hms(prev_date), units = "days"))),
+         MissedDays = ifelse(
+           !is.na(prev_date) & # Make sure lag rows are not NA
+             !is.na(prev_id) &
+             ID == prev_id & # Make sure we have not changed patients
+              date_diff > 1, # Check for more than 1 day between measures
+           date_diff - 1, # Subtract one from the diff to get the missed days
+           0)) # Else no missed days
+
+# Take a look at the engineered fields
+device %>% select(ID, prev_id, prev_date, MeasurementDT_UTC, date_diff, MissedDays)
+
+# Drop temp columns from the df
+device <- device %>% 
+  select(-one_of(c("prev_date", "prev_id", "date_diff")))
+
+# Look at a histogram of missed days for each patient
+missed_days_summ <- device %>% group_by(ID) %>% summarise(TotMissedDays = sum(MissedDays))
+hist(missed_days_summ$TotMissedDays)
+boxplot(missed_days_summ$TotMissedDays)
+summary(missed_days_summ$TotMissedDays)
+median(missed_days_summ$TotMissedDays)
+shapiro.test(missed_days_summ$TotMissedDays)
+
+missed_days_summ %>% filter(TotMissedDays > 0) %>% arrange(desc(TotMissedDays))
+
+### Heart Rate Outliers ###
+# Get IDs of patients with heart rates lower than 40
+low_hr_ids <- device %>% filter(Heart_Rate < 40) %>% select(ID)
+
+# Get all HR values for patients with low HR to compare low readings vs normal readings
+hr_hist <- device %>% 
+  inner_join(low_hr_ids) %>% 
+  mutate(hr_date = date(MeasurementDT_UTC)) %>% 
+  select(ID, Heart_Rate, hr_date) %>% 
+  arrange(ID, hr_date)
+
+# Get average HR for patient with a reading of 39 BPM
+device %>% filter(ID == 43208) %>% group_by(ID) %>% summarise(avg_hr = mean(Heart_Rate))
+
+device %>% filter(Heart_Rate == 0)
+
+# Set HR == 0 to NA
+device <- device %>% mutate(Heart_Rate = ifelse(Heart_Rate == 0, NA, Heart_Rate))
+
+# Impute the Heart_Rate value using mice package and the cart (classification and regression trees) method
+mice_imputes = mice(device, m=5, maxit = 40, method = "cart", print = FALSE)
+
+# Store the imputed values back in the device dataframe
+device <- complete(mice_imputes)
+
+```
+
+## Device Data Correlation and Chi-Squared Independence
+
+```{r Device Continuous Columns Correlation, message=FALSE, warning=FALSE, echo=FALSE}
+
+# Correlation
+# Show the graphical and correlation coefficient between the continuous variables
+pairs(device %>%
+        select(device_cont_cols),
+      lower.panel = panel.smooth, 
+      upper.panel = panel.cor,
+      diag.panel = panel.hist)
+
+# Drop the highly correlated columns
+#~~~~~~~~~ July 28 Change ~~~~~~~~~#
+# device <- device %>% select(-one_of(c("PA_Systolic", "PA_Diastolic")))
+
+device_bool_cols <- c("PAD_Flag", "ThresholdChangeIndicator")
+
+```
+
+## Device Boolean Data
+
+```{r device boolean data exploration, message=FALSE, warning=FALSE, echo=FALSE}
+
+device_bool_cols <- c("PAD_Flag",
+                      "ThresholdChangeIndicator")
+
+n <- length(device_bool_cols) # Number of risk factors boolean columns
+
+# Dataframe to hold descriptive stats for boolean risk factor columns
+device_bool_stats <- data.frame(
+  FieldName = character(n),
+  NumNA = integer(n),
+  stringsAsFactors = FALSE
+)
+
+# Data frame to hold the field names and values of each column
+# for graphing into a single plot 
+device_bool_stacked <- data.frame(
+  FieldName = character(),
+  Values = factor(),
+  stringsAsFactors = TRUE
+)
+
+i <- 1 # Index
+
+for (my_col in device_bool_cols) { # Loop through the bool cols in risks
+  
+  x <- device[[my_col]] # Save only the current col from the df
+  
+  # Get the number of NAs
+  num_na <- length(x[is.na(x)])
+  
+  # Filter out the NA values
+  x <- x[!is.na(x)]
+  
+  # Convert the data from char to numeric
+  x <- as.numeric(x)
+  
+  # Add the the column name repeated and the boolean values to the stacked dataframe
+  # We repeat the field name as many times as the non-NA values for this field along
+  # with the non-NA values into a matrix with two columns and row bind to the existing df
+  device_bool_stacked <- rbind(device_bool_stacked, 
+                             matrix(c(rep(my_col, length(x)), as.logical(x)), ncol = 2, nrow = length(x)))
+  
+  x <- as.data.frame(x)
+  
+  # Add the descriptive stats to the summary data frame
+  device_bool_stats[i, "FieldName"] <- my_col
+  device_bool_stats[i, "NumNA"] <- num_na
+  
+  i <- i + 1 # Increment index
+}
+
+# Reset the field names for the df
+colnames(device_bool_stacked) <- c("FieldName","Values")
+
+# Graph the proportions of true and false for each of the boolean
+# fields in the risks dataframe
+device_bool_stacked %>% 
+  count(Values, FieldName) %>% 
+  group_by(FieldName) %>% 
+  mutate(pct = n/sum(n)) %>% 
+  ggplot(aes(fill = Values, y = pct, x = FieldName)) +
+  geom_bar(position="fill", stat="identity") +
+  theme(panel.background = element_blank()) +
+  xlab("Field Name") + ylab("Proportion of True/False") + ggtitle("Device Boolean Proportions") +
+  scale_fill_manual(values = c(laxGray, laxMaroon)) +
+  scale_y_continuous(labels = scales::percent) +
+  theme(legend.position="bottom", axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 0.95)) +
+  geom_text(aes(label = paste0(round(pct*100), "%")), position = position_stack(vjust = 0.5), size = 3, 
+            color="white", fontface = "bold")
+
+# Display the descripive stats in a formatted table
+device_bool_stats
+
+```
+
+# Risk Factor Data Exploratory Analysis
+
+
+## Risk Factor Continuous Data
+
+```{r risks continuous data exploration, message=FALSE, warning=FALSE, echo=FALSE}
+# Analysis of continuous data
+risk_cont_cols <- c("TotalHospitalAdmissionCount",
+                    "HeartFailureHospitalAdmissionCount",
+                    "SecondaryHFAdmissionCount",
+                    "AvgSystolic",
+                    "AvgDiastolic",
+                    "EjectionFraction",
+                    "CalculatedBMI",
+                    "Age")
+
+# Data frame to hold descriptive stats for the 
+# continuous variables in the risk factors data
+risk_cont_stats <- data.frame(
+  FieldName = character(),
+  Max = integer(),
+  Min = integer(),
+  IQR = double(),
+  Median = double(),
+  StdDev = double(),
+  NumNA = integer(),
+  NormalDist = logical(),
+  NumHighOutliers = integer(),
+  NumLowOutliers = integer()
+)
+
+# Loop through the continuous columns in the dataframe
+for (i in 1:length(risk_cont_cols)) {
+  col <- risk_cont_cols[i] # Get the column index of the next column for analysis
+  
+  # Pass the continuous column and column name to  the descriptive analysis function
+  # Add the resulting data frame row to the summary data frame
+  risk_cont_stats <- rbind(risk_cont_stats, cont_desc_analysis(as.numeric(risks[[col]]), col))
+}
+
+# Display a formatted table of the risk factor continuous analysis
+risk_cont_stats %>%
+  gt() %>%
+  tab_header(
+    title = "CardioMEMS Patient Risk Factors Dataset Summary",
+    subtitle = "As of 2020-07-21"
+  ) %>%
+  fmt_number(
+    columns = vars(Max, Min, IQR, Median, StdDev, NumNA, NumHighOutliers, NumLowOutliers),
+    suffixing = TRUE
+  ) %>% 
+  gtsave("risk factors cont var stats.rtf")
+
+# How many patients have secondary HF Admission Count > 0?
+risks %>% filter(SecondaryHFAdmissionCount > 0) %>% group_by(ID) %>% tally()
+
+```
+
+## Risk Factor Continuous Feature Engineering
+
+```{r Risk Factor Continuous Feature Engineering, message=FALSE, warning=FALSE, echo=FALSE}
+
+# Drop AvgSystolic, AvgDiastolic, and CalculatedBMI columns since they are missing data
+risks <- risks %>% select(-one_of(c("AvgSystolic", "AvgDiastolic", "CalculatedBMI")))
+
+# Change Ejection Fraction to a categorical based on values from 
+# https://www.mayoclinic.org/ejection-fraction/expert-answers/faq-20058286
+risks <- risks %>% 
+  mutate(EjectionFractionCat = as.factor(case_when(
+    EjectionFraction >= 55 ~ "Normal",
+    EjectionFraction < 50 ~ "Reduced",
+    EjectionFraction < 55 & EjectionFraction >=50 ~ "Borderline",
+    TRUE ~ "Missing"
+  ))) %>% 
+  select(-EjectionFraction) # Drop the original column
+
+# Continuous columns list
+risk_cont_cols <- c("TotalHospitalAdmissionCount",
+                    "HeartFailureHospitalAdmissionCount",
+                    "SecondaryHFAdmissionCount",
+                    "Age")
+
+### Length of Program Participation ###
+# Add column to risks dataset for length of participation in program
+# Determine how long each participant was in the program measured in months by
+# getting the earliest and latest measurement dates from the device data. Extract
+# the years and multiply by 12, then add the number of months, then add 1
+x <- device %>% group_by(ID) %>% 
+  summarise(start_par = min(MeasurementDT_UTC), end_par = max(MeasurementDT_UTC)) %>% 
+  mutate(LengthParticipation = (as.period(start_par %--% end_par)$year * 12) + (as.period(start_par %--% end_par)$month) + 1) %>%
+  select(ID, LengthParticipation)
+
+# Add the LengthParticipation column to the Risk Factors data
+risks <- risks %>% inner_join(x)
+
+# Get a summary of the length of program participation
+summary(risks$LengthParticipation)
+median(risks$LengthParticipation)
+
+# Update the continuous column values
+risk_cont_cols <- c(risk_cont_cols, "LengthParticipation")
+
+# Correlation
+# Show the graphical and correlation coefficient between the continuous variables
+pairs(risks %>%
+        select(risk_cont_cols),
+      lower.panel = panel.smooth, 
+      upper.panel = panel.cor,
+      diag.panel = panel.hist)
+
+```
+
+
+## Risk Factor Boolean Data Feature Engineering
+
+```{r Risk Factor Boolean Data Feature Engineering, message=FALSE, warning=FALSE, echo=FALSE}
+
+# Drop the BPUncontrolled variable because of missing values and
+# similar columns
+risks <- risks %>% select(-"BPUncontrolled")
+
+# Create binomial response variable to hold if threshold changes have occured 
+threshold_change_summary <- device %>% 
+  group_by(ID) %>% 
+  summarise(TotThresholdChanges = sum(ThresholdChangeIndicator)) %>% 
+  mutate(PADThresholdChangeInd = case_when(
+    TotThresholdChanges > 0 ~ 1,
+    TotThresholdChanges == 0 ~ 0,
+    TRUE ~ -9999 # Error
+  )) %>% 
+  select(-"TotThresholdChanges") # Drop the temp column
+
+# Add PADThresholdChangeInd to the risk factor dataset
+risks <- risks %>% inner_join(threshold_change_summary)
+
+# Combine the Complicated/Uncomplicated Hypertension variables since they are sparse
+risks <- risks %>% 
+  mutate(Hypertension = ifelse((HypertensionComplicated == 1 | HypertensionUncomplicated == 1), 1, 0)) %>% 
+  select(-one_of(c("HypertensionComplicated", "HypertensionUncomplicated")))
+
+# Combine the Complicated/Uncomplicated Diabetes variables since they are highly correlated
+risks <- risks %>% 
+  mutate(Diabetes = ifelse((DiabetesUncomplicated == 1 | DiabetesComplicated == 1), 1, 0)) %>%
+  select(-one_of("DiabetesUncomplicated", "DiabetesComplicated"))
+```
+
+## Risk Factor Boolean Data Exploration
+
+```{r risks boolean data exploration, message=FALSE, warning=FALSE, echo=FALSE}
+
+# Drop these columns from the dataset because they are all FALSE/No
+risk_bool_drop_cols <- c("WeightLoss", "Arrythmia", "Glitazones", "Paralysis", "AIDS", "LossAnemia")
+
+risks <- risks %>% 
+  select(-one_of(risk_bool_drop_cols))
+
+# The boolean columns for risk factors
+risk_bool_cols <- c("AllAdmission",
+                    "HFAdmission",
+                    "IVDiuretic",
+                    "PADThresholdChangeInd",
+                    "Male",
+                    "Hypertension",
+                    "Obesity",
+                    "Diabetes",
+                    "CoronaryArteryDisease",
+                    "ValvularHeartDisease",
+                    "HighCholesterol",
+                    "AlcoholAbuse",
+                    "SleepApnea",
+                    "CPAPUsage",
+                    "RenalFailure",
+                    "Insulin",
+                    "RaceWhite",
+                    "SGLT2",
+                    "Metformin",
+                    "DPPV4",
+                    "GLP1",
+                    "CongestiveHF",
+                    "PulmonaryCirculation",
+                    "PeripheralVascular",
+                    "NeurologicalDisorder",
+                    "ChronicPulmonary",
+                    "Hypothyroidism",
+                    "LiverDisease",
+                    "PepticUlcer",
+                    "Lymphoma",
+                    "Cancer",
+                    "Tumor",
+                    "Arthritis",
+                    "Coagulopathy",
+                    "ElectrolyteDisorder",
+                    "DeficiencyAnemia",
+                    "DrugAbuse",
+                    "Psychoses",
+                    "Depression")
+
+n <- length(risk_bool_cols) # Number of risk factors boolean columns 
+
+# Dataframe to hold descriptive stats for boolean risk factor columns
+risk_bool_stats <- data.frame(
+  FieldName = character(n),
+  NumNA = integer(n),
+  stringsAsFactors = FALSE
+)
+
+# Data frame to hold the field names and values of each column
+# for graphing into a single plot 
+risk_bool_stacked <- data.frame(
+  FieldName = character(),
+  Values = logical(),
+  stringsAsFactors = FALSE
+)
+
+i <- 1 # Index
+
+for (my_col in risk_bool_cols) { # Loop through the bool cols in risks
+  
+  x <- risks[[my_col]] # Save only the current col from the df
+  
+  # Get the number of NAs
+  num_na <- length(x[is.na(x)])
+  
+  # Filter out the NA values
+  x <- x[!is.na(x)]
+  
+  # Convert the data from char to numeric
+  x <-as.numeric(x)
+  
+  # Add the the column name repeated and the boolean values to the stacked dataframe
+  # We repeat the field name as many times as the non-NA values for this field along
+  # with the non-NA values into a matrix with two columns and row bind to the existing df
+  risk_bool_stacked <- rbind(risk_bool_stacked, 
+                             matrix(c(rep(my_col, length(x)), as.logical(x)), ncol = 2, nrow = length(x)))
+  
+  x <- as.data.frame(x)
+  
+  # Add the descriptive stats to the summary data frame
+  risk_bool_stats[i, "FieldName"] <- my_col
+  risk_bool_stats[i, "NumNA"] <- num_na
+  
+  i <- i + 1 # Increment index
+}
+
+# Reset the field names for the df
+colnames(risk_bool_stacked) <- c("FieldName","Values")
+
+# Risk response variables
+risk_response_cols <- c("AllAdmission", "HFAdmission", "IVDiuretic", "PADThresholdChangeInd")
+
+# Filter out the response variables
+risk_bool_stacked <- risk_bool_stacked %>% filter(!FieldName %in% risk_response_cols)
+n <- n - length(risk_response_cols)
+risk_bool_cols <- risk_bool_cols[5:39]
+
+# Set up some variable to break out the large number of boolean
+# columns into something reasonable to plot together
+plots_per_iter <- 12 # Max number of variables plotted together
+num_plots <- ceiling(n/plots_per_iter) # Calculate the number of plots to create (round up)
+#num_plots <- 1 # Temp?
+start_plot <- 1 # Start at the beginning variable
+end_plot <- plots_per_iter # First iteration ending variable
+
+for(plt in 1:num_plots) { # Loop through the number of plots to create
+  # Get the names of the variables for the plot into a vector
+  #plot_fields <- risk_response_cols[start_plot:end_plot]
+  plot_fields <- risk_bool_cols[start_plot:end_plot]
+  
+  # Graph the proportions of true and false for each of the boolean
+  # fields in the risks dataframe
+  my_plot <- risk_bool_stacked %>% 
+    filter(FieldName %in% plot_fields) %>% # Filter for only the columns we want
+    count(Values, FieldName) %>% 
+    group_by(FieldName) %>% 
+    mutate(pct = n/sum(n)) %>% # Calculate the startistics for the plot
+    ggplot(aes(fill = Values, y = pct, x = FieldName)) +
+    geom_bar(position="fill", stat="identity") +
+    theme(panel.background = element_blank()) +
+    xlab("Field Name") + ylab("Proportion of True/False") + 
+    ggtitle(paste("Device Boolean Proportions", plt)) +
+    scale_fill_manual(values = c(laxGray, laxMaroon)) +
+    scale_y_continuous(labels = scales::percent) +
+    theme(legend.position="bottom", axis.text.x = element_text(angle = 90, vjust = 0.2, hjust = 0.95)) +
+    geom_text(aes(label = paste0(round(pct*100), "%")), position = position_stack(vjust = 0.5), size = 3, 
+              color="white", fontface = "bold") + coord_flip()
+  
+  print(my_plot) # Output the plot
+  
+  # Increment the starting and ending plot variables
+  # Making sure we don't go past the total number of variables
+  start_plot <- start_plot + plots_per_iter
+  end_plot <- end_plot + plots_per_iter
+  if(end_plot > n) end_plot = n
+}
+
+# Display the descripive stats for fields with NA values
+print("Risk Factor Boolean columns with NA")
+risk_bool_stats %>% filter(NumNA > 0)
+
+# Create a table of proprtions that are TRUE/FALSE for the other boolean columns
+risk_bool_stacked %>% 
+  filter(FieldName %in% risk_bool_cols[5:n]) %>% 
+  group_by(FieldName) %>% 
+  count(Values) %>% 
+  mutate(PercentTrue = round(n/sum(n), 4), PercentFalse = round(1 - PercentTrue, 4)) %>%
+  ungroup() %>% 
+  filter(Values == TRUE) %>% 
+  select(-c(n, Values)) %>% 
+  arrange(PercentFalse) %>% 
+  gt() %>% 
+  tab_header(
+    title = "CardioMEMS Patient Risk Factors Boolean Proportions",
+    subtitle = "As of 2020-07-21"
+  ) %>%
+  cols_label(
+    FieldName = "Field Name",
+    PercentTrue = "Percent True",
+    PercentFalse = "Percent False"
+  ) %>% 
+  fmt_percent(
+    columns = vars(PercentTrue, PercentFalse)
+  ) %>% 
+  gtsave(filename = "risk_bool_prop.rtf")
+
+```
+
+## Risk Factor Categorical Data
+
+```{r risks categorical data exploration, message=FALSE, warning=FALSE, echo=FALSE}
+# Columns with categorical information
+risk_cat_cols <- c("AverageDailyBPCategory",
+                   "BMICategory",
+                   "TobaccoUse",
+                   "EjectionFractionCat")
+
+# Empty dataframe to  hold the descriptive stats
+# for categorical data
+risk_cat_stats <- data.frame(
+  FieldName = character(),
+  NumNA = integer()
+)
+
+# Loop over the categorial columns in the risk factors data
+for (col in risk_cat_cols) {
+  num_na <- as.integer(risks %>% select(col) %>% filter(is.na(.)) %>% count()) # Get count of NA values
+  
+  # Add the descriptive stats to the data frame
+  risk_cat_stats <- rbind(risk_cat_stats, data.frame("FieldName" = col, "NumNA" = num_na))
+}
+
+# Display the categorical variable descriptive stats in a formatted table
+risk_cat_stats
+
+# Change the BMICategory to a factor with values/missing
+risks <- risks %>% 
+  mutate(BMICategory = as.factor(case_when(
+    BMICategory == "0" ~ "Underweight",
+    BMICategory == "1" ~ "Normal",
+    BMICategory == "2" ~ "Overweight",
+    BMICategory == "3" ~ "Obese",
+    BMICategory == "4" ~ "ExtremeObesity",
+    TRUE ~ "Missing"
+  )))
+
+# Calculate the proportion of each value in the BMI Category column
+bmi_cat <- risks %>% 
+  mutate(cat_level = BMICategory) %>% 
+  select(cat_level) %>% 
+  count(cat_level) %>% 
+  mutate(pct = n/sum(n))
+
+# Change the AverageBPCategory to a factor with values/missing
+risks <- risks %>% 
+  mutate(AverageDailyBPCategory = as.factor(case_when(
+    AverageDailyBPCategory == "0" ~ "Normal",
+    AverageDailyBPCategory == "1" ~ "Elevated",
+    AverageDailyBPCategory == "2" ~ "StageI",
+    AverageDailyBPCategory == "3" ~ "StageII",
+    TRUE ~ "Missing"
+  )))
+
+# Calculate the proportion of each value in the Avg Daily BP column
+avg_daily_bp <- risks %>% 
+  mutate(cat_level = AverageDailyBPCategory) %>% 
+  select(cat_level) %>% 
+  count(cat_level) %>% 
+  mutate(pct = n/sum(n))
+
+# Recode the tobacco use values from digits to actual values
+risks <- risks %>% 
+  mutate(TobaccoUse = case_when(
+    TobaccoUse == "0" ~ "Never",
+    TobaccoUse == "1" ~ "Former",
+    TobaccoUse == "2" ~ "Current",
+    TRUE ~ "Missing"
+  ))
+
+# Calculate the proportion of each value in the Tobacco Use category column
+tobacco_cat <- risks %>% 
+  mutate(cat_level = TobaccoUse) %>% 
+  select(cat_level) %>% 
+  count(cat_level) %>% 
+  mutate(pct = n/sum(n))
+
+# Calculate the proportion of each value in the Ejection Fraction category column
+eject_frac_cat <- risks %>% 
+  mutate(cat_level = EjectionFractionCat) %>% 
+  select(cat_level) %>% 
+  count(cat_level) %>% 
+  mutate(pct = n/sum(n))
+
+# Generate a stacked bar chart for BMI
+cat_graph(bmi_cat, "BMI Category")
+
+# Generate stacked bar graph for Avg Daily BP
+cat_graph(avg_daily_bp, "Average Daily BP Category")
+
+# Generate stacked bar graph for Tobacco Use
+cat_graph(tobacco_cat, "Tobacco Use Category")
+
+# Generate stacked bar graph for Tobacco Use
+cat_graph(eject_frac_cat, "Ejection Fraction Category")
+
+eject_frac_cat %>% select(cat_level, pct) %>% gt() %>% 
+  fmt_percent(
+    columns = vars(pct)
+    ) %>%
+  cols_label(
+    cat_level = "Category",
+    pct = "Percent"
+  ) %>% gtsave("ejection_fraction_pct_table.rtf")
+  
+
+```
+
+# Missing Values Summary
+
+```{r Missing Values, echo=FALSE, message=FALSE, warning=FALSE}
+
+# Get the number of columns with NA values
+ncols_device <- ncol(device)
+ncols_risks <- ncol(risks)
+ncols <- ncols_device + ncols_risks
+
+# Create a data frame to hold the analysis
+na_summary <- data.frame(
+  Dataset = character(ncols),
+  Col_Name = character(ncols),
+  Num_NA_Vals = integer(ncols),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each column and calculate the number of NA values
+for(col in 1:ncols) {
+  if(col <= ncols_device) {
+    na_summary[col, "Dataset"] <- "Device"
+    na_summary[col, "Col_Name"] <- colnames(device)[col]
+    na_summary[col, "Num_NA_Vals"] <- device %>% filter(is.na(device[col])) %>% tally()
+  } else {
+    na_summary[col, "Dataset"] <- "Risks"
+    na_summary[col, "Col_Name"] <- colnames(risks)[col - ncols_device]
+    na_summary[col, "Num_NA_Vals"] <- risks %>% filter(is.na(risks[col - ncols_device])) %>% tally()
+  }
+}
+
+# Filter the summary for only columns that have NA values
+na_summary <- na_summary %>% filter(Num_NA_Vals > 0)
+na_summary # Display table
+
+```
+
+
+# Combining Datasets
+
+```{r Feature Engineering, echo=FALSE, message=FALSE, warning=FALSE}
+
+#~~~~~~~~~ July 28 Change ~~~~~~~~~#
+# Calculate the min, max, and mean values for the device continuous columns as designed
+device_min_max_avg <- device %>% 
+  group_by(ID) %>% 
+  summarise(PA_Systolic_Min = min(PA_Systolic),
+            PA_Systolic_Max = max(PA_Systolic),
+            PA_Systolic_Mean = mean(PA_Systolic),
+            PA_Diastolic_Min = min(PA_Diastolic),
+            PA_Diastolic_Max = max(PA_Diastolic),
+            PA_Diastolic_Mean = mean(PA_Diastolic),
+            PA_Pulsatility_Min = min(PA_Pulsatility),
+            PA_Pulsatility_Max = max(PA_Pulsatility),
+            PA_Pulsatility_Mean = mean(PA_Pulsatility),
+            PA_Mean_Min = min(PA_Mean),
+            PA_Mean_Max = max(PA_Mean),
+            PA_Mean_Mean = mean(PA_Mean),
+            Heart_Rate_Min = min(Heart_Rate),
+            Heart_Rate_Max = max(Heart_Rate),
+            Heart_Rate_Mean = mean(Heart_Rate),
+            PAD_Threshold_Range_Min = min(PAD_Threshold_Range),
+            PAD_Threshold_Range_Max = max(PAD_Threshold_Range),
+            PAD_Threshold_Range_Mean = mean(PAD_Threshold_Range))
+
+# Add these values to the risk factors dataframe
+risks <- risks %>% 
+  inner_join(device_min_max_avg)
+
+# Get the dates of the first and last measurements by each patient ID
+device_first_last_measures <- device %>% 
+  group_by(ID) %>% 
+  summarise(first_reading = min(MeasurementDT_UTC),
+            last_reading = max(MeasurementDT_UTC))
+
+# Get the first readings for each patient for the appropriate continuous variables
+device_first_measures <- device_first_last_measures %>% 
+  inner_join(device, by = c("ID" = "ID", "first_reading" = "MeasurementDT_UTC")) %>% 
+  mutate(PA_Systolic_First = PA_Systolic,
+         PA_Diastolic_First = PA_Diastolic,
+         PA_Pulsatility_First = PA_Pulsatility,
+         PA_Mean_First = PA_Mean,
+         Heart_Rate_First = Heart_Rate,
+         PAD_Threshold_Range_First = PAD_Threshold_Range) %>% 
+  select(ID, PA_Systolic_First, PA_Diastolic_First, PA_Pulsatility_First, PA_Mean_First, Heart_Rate_First, PAD_Threshold_Range_First)
+
+# Get the last readings  for each patient for the appropriate continuous variables
+device_last_measures <- device_first_last_measures %>% 
+  inner_join(device, by = c("ID" = "ID", "last_reading" = "MeasurementDT_UTC")) %>% 
+  mutate(PA_Systolic_Last = PA_Systolic,
+         PA_Diastolic_Last = PA_Diastolic,
+         PA_Pulsatility_Last = PA_Pulsatility,
+         PA_Mean_Last = PA_Mean,
+         Heart_Rate_Last = Heart_Rate,
+         PAD_Threshold_Range_Last = PAD_Threshold_Range) %>% 
+  select(ID, PA_Systolic_Last, PA_Diastolic_Last, PA_Pulsatility_Last, PA_Mean_Last, Heart_Rate_Last, PAD_Threshold_Range_Last)
+
+# Calculate the difference between the first and last measures for each of the variables
+device_diff_measures <- device_first_measures %>% 
+  inner_join(device_last_measures) %>% 
+  group_by(ID) %>% 
+  mutate(PA_Systolic_Diff = (PA_Systolic_First - PA_Systolic_Last),
+         PA_Diastolic_Diff = (PA_Diastolic_First - PA_Diastolic_Last),
+         PA_Pulsatility_Diff = (PA_Pulsatility_First - PA_Pulsatility_Last),
+         PA_Mean_Diff = (PA_Mean_First - PA_Mean_Last),
+         Heart_Rate_Diff = (Heart_Rate_First - Heart_Rate_Last),
+         PAD_Threshold_Range_Diff = (PAD_Threshold_Range_First - PAD_Threshold_Range_Last)) %>% 
+  select(ID, PA_Systolic_Diff, PA_Diastolic_Diff, PA_Pulsatility_Diff, PA_Mean_Diff, Heart_Rate_Diff, PAD_Threshold_Range_Diff)
+
+# Add the diff columns to the risk factors datafarame
+risks <- risks %>% 
+  inner_join(device_diff_measures)
+
+# Scale the device variables by the length of participation in the program
+device_scaled_vars <- device %>% 
+  group_by(ID) %>% 
+  summarise(PAD_Flag_Total = sum(PAD_Flag),
+            ThresholdChangeInd_Total = sum(ThresholdChangeIndicator),
+            MissedDays_Total = sum(MissedDays)) %>% 
+  inner_join(risks) %>% 
+  mutate(PAD_Flag_Scaled = (PAD_Flag_Total/LengthParticipation),
+         ThresholdChangeInd_Scaled = (ThresholdChangeInd_Total/LengthParticipation),
+         MissedDays_Scaled = (MissedDays_Total/LengthParticipation)) %>% 
+  select(ID, PAD_Flag_Scaled, ThresholdChangeInd_Scaled, MissedDays_Scaled)
+
+# Add the scaled variables to the risk factors dataset
+risks <- risks %>% 
+  inner_join(device_scaled_vars)
+
+
+device %>% filter(ID == 29884)
+
+```
+
+```{r Save dataset, echo=FALSE, warning=FALSE, message=FALSE}
+
+# Save the final dataframe as a CSV for modeling purposes
+write_csv(risks, "cardiomems_full_dataset.csv")
+
+```
+
+```{r Combined Dataset Descriptive Analytics, echo=FALSE, warning=FALSE, message=FALSE}
+
+new_cont_cols <- c("PA_Systolic_Min",
+                   "PA_Systolic_Max",
+                   "PA_Systolic_Mean",
+                   "PA_Diastolic_Min",
+                   "PA_Diastolic_Max",
+                   "PA_Diastolic_Mean",
+                   "PA_Pulsatility_Min",
+                   "PA_Pulsatility_Max",
+                   "PA_Pulsatility_Mean",
+                   "PA_Mean_Min",
+                   "PA_Mean_Max",
+                   "PA_Mean_Mean",
+                   "Heart_Rate_Min",
+                   "Heart_Rate_Max",
+                   "Heart_Rate_Mean",
+                   "PAD_Threshold_Range_Min",
+                   "PAD_Threshold_Range_Max",
+                   "PAD_Threshold_Range_Mean",
+                   "PA_Systolic_Diff",
+                   "PA_Diastolic_Diff",
+                   "PA_Pulsatility_Diff",
+                   "PA_Mean_Diff",
+                   "Heart_Rate_Diff",
+                   "PAD_Threshold_Range_Diff",
+                   "PAD_Flag_Scaled",
+                   "ThresholdChangeInd_Scaled",
+                   "MissedDays_Scaled")
+
+n <- length(new_cont_cols)
+
+# Create dataframe to store the statistics for continuous variables
+new_cont_stats <- data.frame(
+  FieldName = character(n),
+  Max = numeric(n),
+  Min = numeric(n),
+  IQR = numeric(n),
+  Median = numeric(n),
+  StdDev = numeric(n),
+  NumNA = integer(n),
+  NormalDist = logical(n),
+  NumHighOutliers = integer(n),
+  NumLowOutliers = integer(n),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each column in the device dataframe and explore the values
+for (i in 1:n) {
+  col_name <- new_cont_cols[i]
+  
+  new_cont_stats[i,] <- cont_desc_analysis(risks[[col_name]], col_name)[1,]
+}
+
+# Display the results of the descriptive analysis for the
+# continuous variables from the CardioMEMS device
+new_cont_stats %>%
+  gt() %>%
+  tab_header(
+    title = "CardioMEMS New Columns Summary"
+  ) %>%
+  fmt_number(
+    columns = vars(Max, Min, IQR, Median, StdDev, NumNA, NumHighOutliers, NumLowOutliers),
+    suffixing = TRUE
+  ) %>% 
+  gtsave("new cols stats.rtf")
+
+```
+
