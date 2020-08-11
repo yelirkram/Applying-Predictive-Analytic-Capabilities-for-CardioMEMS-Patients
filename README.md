@@ -1,4 +1,4 @@
-# Applying-Predictive-Analytic-Capabilities-for-CardioMEMS-Patients
+# Applying Predictive Analytic Capabilities for CardioMEMS Patients
 Paper and code for my Wisconsin Data Science Capstone project in conjunction with the University of Kansas Health System to apply predictive analytics to heart failure patients with a CardioMEMS device.
 
 ## Abstract
